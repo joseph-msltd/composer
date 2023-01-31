@@ -1,0 +1,143 @@
+Title:
+------
+<WIP>
+
+CSV files are dropped in a bucket, bucket triggers a cf, cf triggers a dag and dag updates good records in external Bq table
+stores wrong rows in gcs bucket, dag also reads the wrong records and inserts in BQ error table.
+
+Steps:
+------
+1. CSV File dropped in GCS Bucket 'wedagtobq'
+2. CF named as 'dagtobq' is triggered on creation of a file in that bucket
+3. This CF runs a dag in already created composer environment 'wegcp'
+3. Dag reads the file and dumps good rows in gcs bucket 'we_dag_validated_rows_to_bq', External BQ Table 'wedagrowstobq.students' is mounted in this bucket.
+4. Dag dumps bad rows in error bucket 'we_errored_rows_to_bq'
+5. Dag  inserts the bad rows from error bucket into the Error table 'wedagrowstobq.students-error'
+
+Expected Output:
+----------------
+CSV files are dropped in gcs, good rows gets in normal bq table, bad rows ends in error BQ table
+
+
+Resources:
+----------
+export PROJECT_ID=$(gcloud config get-value project)
+export PROJECT_NUMBER=$(gcloud projects list --filter="project_id:$PROJECT_ID" --format='value(project_number)')
+export SERVICE_ACCOUNT=$(gsutil kms serviceaccount -p $PROJECT_NUMBER)
+echo $PROJECT_ID
+echo $PROJECT_NUMBER
+echo $SERVICE_ACCOUNT
+
+gcloud projects add-iam-policy-binding $PROJECT_ID \
+  --member serviceAccount:$SERVICE_ACCOUNT \
+  --role roles/storage.admin
+
+gcloud projects add-iam-policy-binding $PROJECT_ID \
+  --member serviceAccount:$SERVICE_ACCOUNT \
+  --role roles/pubsub.publisher
+
+
+1. Create GCS Input Bucket 'wedagtobq'
+gcloud storage buckets create gs://wedagtobq  --default-storage-class=Standard --location=europe-west2 --uniform-bucket-level-access
+
+2. Create GCS bucket for External table, 'we_dag_validated_rows_to_bq'
+gcloud storage buckets create gs://we_dag_validated_rows_to_bq  --default-storage-class=Standard --location=europe-west2 --uniform-bucket-level-access
+
+3. Create GCS bucket for Error table, 'we_errored_rows_to_bq'
+gcloud storage buckets create gs://we_errored_rows_to_bq  --default-storage-class=Standard --location=europe-west2 --uniform-bucket-level-access
+
+4. Create a BQ Dataset
+bq --location=europe-west2 mk --dataset wedagrowstobq
+
+5. 
+Create external Table with a schema 'wedagrowstobq.students'
+gsutil cp test-input/student.csv gs://wedagtobq/student.csv
+bq mkdef --autodetect --source_format=CSV "gs://wedagtobq/*.csv" > myschema
+bq mk --external_table_definition=myschema $PROJECT_ID:wedagrowstobq.students
+
+6. Create error Table with a schema 'wedagrowstobq.students-error'
+bq mk -t --description "use-case-1 table" $PROJECT_ID:wedagrowstobq.students-error \
+filename:STRING,loadtime:TIMESTAMP,filecontent:STRING
+
+7. Create Composer 2 Environment 'wegcp'
+gcloud composer environments create wegcp --location europe-west2 --image-version composer-2.0.29-airflow-2.3.3  --service-account "$PROJECT_NUMBER-compute@developer.gserviceaccount.com"
+<...This takes approximately 15mins>
+
+gcloud composer environments storage dags import --environment wegcp --location europe-west2 --source=./dags/composer2_filecopy.py
+
+//get tenant id with below cmd
+gcloud composer environments describe wegcp --location europe-west2 --format='value(config.airflowUri)'
+<use this variable in below cf env vars>
+
+8. Create a CF Trigger on the bucket called 'dagtobq'
+gcloud functions deploy dagtobq \
+  --gen2 \
+  --region=europe-west2 \
+  --runtime=python39 \
+  --source=./cf/ \
+  --entry-point=trigger_dag_gcf \
+  --set-env-vars TENANT_ID=b46a3de165894ce1a53d13d7f7d12dc3 \
+  --trigger-event-filters="type=google.cloud.storage.object.v1.finalized" \
+  --trigger-event-filters="bucket=wedagtobq"
+
+Tear down:
+-----------
+1. Delete cloud function:
+gcloud functions delete dagtobq  --gen2 --region=europe-west2
+
+2. Composer deletion:
+gcloud composer environments delete wegcp --location=europe-west2
+
+3. Delete Dataset and tables inside it:
+bq rm -r -f -d $PROJECT_ID:wedagrowstobq
+
+4. Delete the buckets:
+gsutil rm -r gs://wedagtobq
+gsutil rm -r gs://we_dag_validated_rows_to_bq
+gsutil rm -r gs://we_errored_rows_to_bq
+
+
+Note:
+-----
+-Find how to auto update dags from git repo to airflow dags folder
+
+Future:
+-------
+-Data validate the csv and reject before bq insert
+-send csv file having more than 1 rows
+-errored rows gets in to error folder
+-Create a GCS Error Bucket
+-If update successful, delete the file
+-If update not successful, move the file to error folder.
+-Create a dag that generates a csv file at schedules interval
+
+
+Test:
+------
+Functions-Framework:
+functions-framework --target=trigger_dag_gcf --signature-type=event
+
+Hit cf With payload:
+---------------------
+curl localhost:8080 \
+  -X POST \
+  -H "Content-Type: application/json" \
+  -H "ce-id: 123451234512345" \
+  -H "ce-specversion: 1.0" \
+  -H "ce-time: 2020-01-02T12:34:56.789Z" \
+  -H "ce-type: google.cloud.storage.object.v1.finalized" \
+  -H "ce-source: //storage.googleapis.com/projects/_/buckets/MY-BUCKET-NAME" \
+  -H "ce-subject: objects/MY_FILE.txt" \
+  -d '{
+        "bucket": "cmpsr-input-bucket",
+        "contentType": "text/plain",
+        "kind": "storage#object",
+        "md5Hash": "...",
+        "metageneration": "1",
+        "name": "test - Sheet1.csv",
+        "size": "352",
+        "storageClass": "MULTI_REGIONAL",
+        "timeCreated": "2020-04-23T07:38:57.230Z",
+        "timeStorageClassUpdated": "2020-04-23T07:38:57.230Z",
+        "updated": "2020-04-23T07:38:57.230Z"
+      }'
